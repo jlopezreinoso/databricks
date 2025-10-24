@@ -1,0 +1,48 @@
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+# ================== Config ==================
+src_path   = f"/Volumes/ctlglobal/schbronze/vol_sipcore/seguros/csa/{File_Name}/"
+target     = f"/Volumes/ctlglobal/schbronze/vol_cloudfile/sdp/cobranzas/data/{File_Name}/"
+
+# Columnas de negocio (44 columnas)
+key_cols = [
+    "eje_per","tipo_prod","tipo_cartera","sucursal","ramo","poliza","certificado",
+    "numero_documento","numero_factura","num_id_asegurado","cotizacion","sector",
+    "pago","forma_pago","fecha_vencimiento","dias_mora","fecha_pago"
+]
+
+# ================== Lectura directa y deduplicación ==================
+df = spark.read.format("parquet").load(src_path)
+
+technical_cols = {"_metadata"}
+business_cols = [c for c in df.columns if c not in technical_cols]
+
+df_clean = (
+    df.withColumn(
+        "_row_hash",
+        F.sha2(F.concat_ws("||", *[F.col(c).cast("string") for c in business_cols]), 256)
+    )
+    .dropDuplicates(["_row_hash"])    #  evita duplicados exactos
+)
+
+# ================== Guardar en Delta idempotente ==================
+
+if DeltaTable.isDeltaTable(spark, target):
+    tgt = DeltaTable.forPath(spark, target)
+    (tgt.alias("t")
+        .merge(
+            df_clean.alias("s"),
+            "t._row_hash = s._row_hash"
+        )
+        .whenNotMatchedInsertAll()
+        .execute())
+else:
+    (df_clean.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(target))
+
+print("Carga completada sin duplicados. Archivos Parquet procesados directamente.")
+print("Desarrollado por Jose Lopez")
