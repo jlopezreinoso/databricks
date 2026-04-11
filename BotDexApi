@@ -1,0 +1,457 @@
+# =============================================================================
+# DEXSCREENER TOKEN BOT v2 - DATABRICKS
+# Corregido: permisos Delta Lake + schema API actualizado
+# =============================================================================
+
+# COMMAND ----------
+# Celda 1: Dependencias
+
+# %pip install requests
+
+# COMMAND ----------
+# Celda 2: Imports
+
+import requests
+import json
+import time
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    StructType, StructField, StringType, BooleanType,
+    TimestampType, ArrayType, MapType
+)
+from pyspark.sql.functions import col, current_timestamp
+from IPython.display import display, HTML
+
+spark = SparkSession.builder.getOrCreate()
+
+# =============================================================================
+# COMMAND ----------
+# Celda 3: CONFIGURACIÓN - Edita aquí
+
+# ---- Palabras clave para alertas ----
+KEYWORDS = ["moon", "ai", "pump", "pepe", "meme", "elon", "nasa", "inu", "doge", "trump"]
+
+# ---- Filtrar cadenas ([] = todas) ----
+CHAIN_FILTER = []  # Ej: ["solana", "base", "ethereum", "monad"]
+
+# ---- Intervalo entre llamadas (segundos) ----
+POLL_INTERVAL = 30
+
+# ---- Ciclos máximos (None = corre hasta Stop) ----
+MAX_CYCLES = None
+
+# ---- RUTA DE ALMACENAMIENTO ----
+# Opción A: Unity Catalog (recomendado si tienes UC habilitado)
+USE_UNITY_CATALOG = False  # Usa Volumes path definido abajo
+UC_CATALOG   = "main"
+UC_SCHEMA    = "dexscreener"
+UC_TABLE_TOKENS = f"{UC_CATALOG}.{UC_SCHEMA}.tokens"
+UC_TABLE_ALERTS = f"{UC_CATALOG}.{UC_SCHEMA}.alerts"
+
+# Opción B: Unity Catalog Volumes (tu ruta configurada)
+VOL_TOKENS = "/Volumes/ctlfinanciero/schgold/vol_ddfinanciero_model/Objetos/dexscreener_tokens"
+VOL_ALERTS = "/Volumes/ctlfinanciero/schgold/vol_ddfinanciero_model/Objetos/dexscreener_alerts"
+
+# ---- API ----
+API_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+
+# =============================================================================
+# COMMAND ----------
+# Celda 4: Schema (basado en la API real)
+
+LINK_SCHEMA = StructType([
+    StructField("type",  StringType(), True),
+    StructField("label", StringType(), True),
+    StructField("url",   StringType(), True),
+])
+
+TOKEN_SCHEMA = StructType([
+    StructField("token_address", StringType(),  True),
+    StructField("chain_id",      StringType(),  True),
+    StructField("url",           StringType(),  True),
+    StructField("icon",          StringType(),  True),
+    StructField("header",        StringType(),  True),
+    StructField("description",   StringType(),  True),
+    StructField("links_json",    StringType(),  True),   # JSON string
+    StructField("cto",           BooleanType(), True),
+    StructField("updated_at",    StringType(),  True),   # ISO string original
+    StructField("fetched_at",    TimestampType(), True),
+])
+
+ALERT_SCHEMA = StructType([
+    StructField("token_address", StringType(),  True),
+    StructField("chain_id",      StringType(),  True),
+    StructField("keyword",       StringType(),  True),
+    StructField("description",   StringType(),  True),
+    StructField("url",           StringType(),  True),
+    StructField("alerted_at",    TimestampType(), True),
+])
+
+# =============================================================================
+# COMMAND ----------
+# Celda 5: Funciones de almacenamiento
+
+def get_paths():
+    """Retorna (tokens_path, alerts_path) según configuración."""
+    if USE_UNITY_CATALOG:
+        return UC_TABLE_TOKENS, UC_TABLE_ALERTS
+    return VOL_TOKENS, VOL_ALERTS
+
+
+def init_tables():
+    """Crea tablas Delta vacías si no existen."""
+    tok_path, alt_path = get_paths()
+    try:
+        if USE_UNITY_CATALOG:
+            spark.sql(f"CREATE SCHEMA IF NOT EXISTS {UC_CATALOG}.{UC_SCHEMA}")
+            spark.createDataFrame([], TOKEN_SCHEMA).write \
+                .format("delta").mode("ignore") \
+                .saveAsTable(UC_TABLE_TOKENS)
+            spark.createDataFrame([], ALERT_SCHEMA).write \
+                .format("delta").mode("ignore") \
+                .saveAsTable(UC_TABLE_ALERTS)
+        else:
+            spark.createDataFrame([], TOKEN_SCHEMA).write \
+                .format("delta").mode("ignore").save(tok_path)
+            spark.createDataFrame([], ALERT_SCHEMA).write \
+                .format("delta").mode("ignore").save(alt_path)
+        print(f"  OK Tokens  -> {tok_path}")
+        print(f"  OK Alertas -> {alt_path}")
+    except Exception as e:
+        print(f"  ADVERTENCIA init_tables: {e}")
+
+
+def get_existing_addresses():
+    """Retorna set de token_address ya guardados."""
+    tok_path, _ = get_paths()
+    try:
+        if USE_UNITY_CATALOG:
+            df = spark.table(UC_TABLE_TOKENS)
+        else:
+            df = spark.read.format("delta").load(tok_path)
+        return set(df.select("token_address").rdd.flatMap(lambda x: x).collect())
+    except Exception:
+        return set()
+
+
+def save_tokens(tokens: list):
+    tok_path, _ = get_paths()
+    if not tokens:
+        return
+    now = datetime.utcnow()
+    rows = [{
+        "token_address": t.get("tokenAddress"),
+        "chain_id":      t.get("chainId"),
+        "url":           t.get("url"),
+        "icon":          t.get("icon"),
+        "header":        t.get("header"),
+        "description":   (t.get("description") or "").strip(),
+        "links_json":    json.dumps(t.get("links") or []),
+        "cto":           bool(t.get("cto", False)),
+        "updated_at":    t.get("updatedAt", ""),
+        "fetched_at":    now,
+    } for t in tokens]
+    df = spark.createDataFrame(rows, TOKEN_SCHEMA)
+    if USE_UNITY_CATALOG:
+        df.write.format("delta").mode("append").saveAsTable(UC_TABLE_TOKENS)
+    else:
+        df.write.format("delta").mode("append").save(tok_path)
+
+
+def save_alerts(alerts: list):
+    _, alt_path = get_paths()
+    if not alerts:
+        return
+    df = spark.createDataFrame(alerts, ALERT_SCHEMA)
+    if USE_UNITY_CATALOG:
+        df.write.format("delta").mode("append").saveAsTable(UC_TABLE_ALERTS)
+    else:
+        df.write.format("delta").mode("append").save(alt_path)
+
+# =============================================================================
+# COMMAND ----------
+# Celda 6: Funciones de análisis
+
+def fetch_tokens() -> list:
+    headers = {"Accept": "*/*"}
+    resp = requests.get(API_URL, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, list) else []
+
+
+def filter_new(tokens: list, existing: set) -> list:
+    result = []
+    for t in tokens:
+        addr = t.get("tokenAddress")
+        if not addr or addr in existing:
+            continue
+        chain = t.get("chainId", "")
+        if CHAIN_FILTER and chain not in CHAIN_FILTER:
+            continue
+        result.append(t)
+    return result
+
+
+def check_keywords(tokens: list) -> list:
+    hits = []
+    now = datetime.utcnow()
+    for t in tokens:
+        desc  = (t.get("description") or "").lower()
+        addr  = (t.get("tokenAddress") or "").lower()
+        links = t.get("links") or []
+        link_text = " ".join((l.get("url","") + " " + l.get("label","")) for l in links).lower()
+        full_text = desc + " " + addr + " " + link_text
+        for kw in KEYWORDS:
+            if kw.lower() in full_text:
+                hits.append({
+                    "token_address": t.get("tokenAddress"),
+                    "chain_id":      t.get("chainId"),
+                    "keyword":       kw,
+                    "description":   (t.get("description") or "")[:300],
+                    "url":           t.get("url"),
+                    "alerted_at":    now,
+                })
+    return hits
+
+
+def chain_stats(tokens: list) -> dict:
+    stats = {}
+    for t in tokens:
+        c = t.get("chainId", "unknown")
+        stats[c] = stats.get(c, 0) + 1
+    return dict(sorted(stats.items(), key=lambda x: -x[1]))
+
+
+def display_summary(cycle, new_tokens, alerts, total_seen, raw_total):
+    stats = chain_stats(new_tokens)
+    ts = datetime.now().strftime("%H:%M:%S")
+
+    bar_rows = ""
+    max_c = max(stats.values(), default=1)
+    chain_colors = {"solana":"#639922","base":"#378ADD","ethereum":"#7F77DD","monad":"#D85A30"}
+    for ch, cnt in stats.items():
+        pct = int(cnt / max_c * 100)
+        color = chain_colors.get(ch, "#888780")
+        bar_rows += f"""
+        <tr>
+          <td style='padding:3px 10px;color:#666;font-size:12px;width:80px'>{ch}</td>
+          <td style='padding:3px 6px;width:120px'>
+            <div style='background:#f0f0f0;border-radius:3px;height:10px;overflow:hidden'>
+              <div style='background:{color};height:100%;width:{pct}%'></div>
+            </div>
+          </td>
+          <td style='padding:3px 6px;font-size:12px;font-weight:500'>{cnt}</td>
+        </tr>"""
+
+    alert_rows = ""
+    for a in alerts[:8]:
+        alert_rows += f"""
+        <tr style='background:#fffbe6'>
+          <td style='padding:3px 8px;color:#b7791f;font-weight:500'>{a['keyword']}</td>
+          <td style='padding:3px 8px;font-size:11px;color:#555;font-family:monospace'>{(a['token_address'] or '')[:16]}...</td>
+          <td style='padding:3px 8px;color:#888;font-size:11px'>{a['chain_id']}</td>
+          <td style='padding:3px 8px'><a href='{a['url']}' target='_blank' style='font-size:11px'>Ver →</a></td>
+        </tr>"""
+    if not alert_rows:
+        alert_rows = "<tr><td colspan='4' style='color:#aaa;padding:6px 8px;font-size:12px'>Sin coincidencias en este ciclo</td></tr>"
+
+    # tokens con descripción
+    with_desc = sum(1 for t in new_tokens if t.get("description","").strip())
+    with_links = sum(1 for t in new_tokens if t.get("links"))
+    with_twitter = sum(1 for t in new_tokens if any(l.get("type")=="twitter" for l in (t.get("links") or [])))
+
+    html = f"""
+    <div style='font-family:system-ui,sans-serif;border:1px solid #e2e8f0;border-radius:10px;
+                padding:16px;margin:8px 0;background:#fff;max-width:900px'>
+      <div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;
+                  border-bottom:1px solid #f0f0f0;padding-bottom:10px'>
+        <div style='display:flex;align-items:center;gap:8px'>
+          <div style='width:8px;height:8px;border-radius:50%;background:#1D9E75'></div>
+          <span style='font-size:15px;font-weight:600;color:#1a202c'>DexScreener Bot</span>
+          <span style='font-size:12px;color:#888;background:#f7f7f7;padding:2px 8px;border-radius:999px'>
+            Ciclo #{cycle}
+          </span>
+        </div>
+        <span style='font-size:12px;color:#888'>{ts} UTC</span>
+      </div>
+
+      <div style='display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:14px'>
+        <div style='background:#f7fafc;border-radius:8px;padding:10px 12px;text-align:center'>
+          <div style='font-size:10px;color:#888;margin-bottom:2px'>API total</div>
+          <div style='font-size:20px;font-weight:600;color:#2d3748'>{raw_total}</div>
+        </div>
+        <div style='background:#f7fafc;border-radius:8px;padding:10px 12px;text-align:center'>
+          <div style='font-size:10px;color:#888;margin-bottom:2px'>Nuevos</div>
+          <div style='font-size:20px;font-weight:600;color:#2d3748'>{len(new_tokens)}</div>
+        </div>
+        <div style='background:#f7fafc;border-radius:8px;padding:10px 12px;text-align:center'>
+          <div style='font-size:10px;color:#888;margin-bottom:2px'>Acumulado</div>
+          <div style='font-size:20px;font-weight:600;color:#2d3748'>{total_seen}</div>
+        </div>
+        <div style='background:#f7fafc;border-radius:8px;padding:10px 12px;text-align:center'>
+          <div style='font-size:10px;color:#888;margin-bottom:2px'>Con Twitter</div>
+          <div style='font-size:20px;font-weight:600;color:#2d3748'>{with_twitter}</div>
+        </div>
+        <div style='background:{"#fffde7" if alerts else "#f7fafc"};border-radius:8px;padding:10px 12px;text-align:center'>
+          <div style='font-size:10px;color:#888;margin-bottom:2px'>Alertas</div>
+          <div style='font-size:20px;font-weight:600;color:{"#d97706" if alerts else "#2d3748"}'>{len(alerts)}</div>
+        </div>
+      </div>
+
+      <div style='display:grid;grid-template-columns:1fr 1fr;gap:14px'>
+        <div>
+          <div style='font-size:10px;font-weight:600;color:#888;margin-bottom:8px;
+                      text-transform:uppercase;letter-spacing:.06em'>Por cadena (nuevos)</div>
+          <table style='width:100%;border-collapse:collapse'>
+            {bar_rows if bar_rows else "<tr><td style='color:#aaa;font-size:12px;padding:4px'>Sin nuevos tokens</td></tr>"}
+          </table>
+        </div>
+        <div>
+          <div style='font-size:10px;font-weight:600;color:#888;margin-bottom:8px;
+                      text-transform:uppercase;letter-spacing:.06em'>Alertas keyword</div>
+          <table style='width:100%;border-collapse:collapse;font-size:12px'>
+            <tr style='color:#aaa;font-size:10px'>
+              <td style='padding:2px 8px'>Keyword</td>
+              <td style='padding:2px 8px'>Address</td>
+              <td style='padding:2px 8px'>Chain</td>
+              <td style='padding:2px 8px'>Link</td>
+            </tr>
+            {alert_rows}
+          </table>
+        </div>
+      </div>
+    </div>
+    """
+    display(HTML(html))
+
+# =============================================================================
+# COMMAND ----------
+# Celda 7: Loop principal
+
+def run_bot():
+    print("=" * 60)
+    print("  DEXSCREENER BOT v2 - INICIANDO")
+    print("=" * 60)
+    print(f"  Keywords : {KEYWORDS}")
+    print(f"  Cadenas  : {CHAIN_FILTER or 'Todas'}")
+    print(f"  Intervalo: {POLL_INTERVAL}s")
+    print(f"  Storage  : {'Unity Catalog' if USE_UNITY_CATALOG else 'Volumes'}")
+    print("=" * 60)
+    print("\nInicializando tablas Delta...")
+    init_tables()
+
+    cycle = 0
+    total_seen = 0
+
+    try:
+        while True:
+            if MAX_CYCLES and cycle >= MAX_CYCLES:
+                print(f"\nCiclos completados: {MAX_CYCLES}. Bot detenido.")
+                break
+
+            cycle += 1
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Ciclo #{cycle}...")
+
+            try:
+                raw = fetch_tokens()
+                existing = get_existing_addresses()
+                new_tokens = filter_new(raw, existing)
+                alerts = check_keywords(new_tokens)
+
+                save_tokens(new_tokens)
+                save_alerts(alerts)
+
+                total_seen += len(new_tokens)
+                display_summary(cycle, new_tokens, alerts, total_seen, len(raw))
+
+            except requests.exceptions.RequestException as e:
+                print(f"  ERROR red: {e}")
+            except Exception as e:
+                import traceback
+                print(f"  ERROR: {e}")
+                traceback.print_exc()
+
+            if MAX_CYCLES and cycle >= MAX_CYCLES:
+                break
+
+            print(f"  Esperando {POLL_INTERVAL}s... (Stop para detener)")
+            time.sleep(POLL_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("\nBot detenido manualmente.")
+
+    print(f"\nFin: {total_seen} tokens nuevos en {cycle} ciclos.")
+
+
+run_bot()
+
+# =============================================================================
+# COMMAND ----------
+# Celda 8: Ver tokens guardados
+
+def query_tokens(limit=50, chain=None):
+    tok_path, _ = get_paths()
+    if USE_UNITY_CATALOG:
+        df = spark.table(UC_TABLE_TOKENS)
+    else:
+        df = spark.read.format("delta").load(tok_path)
+    if chain:
+        df = df.filter(col("chain_id") == chain)
+    print(f"Total tokens: {df.count()}")
+    df.select("chain_id","token_address","description","cto","updated_at","fetched_at") \
+      .orderBy(col("fetched_at").desc()) \
+      .show(limit, truncate=60)
+
+query_tokens()
+
+# =============================================================================
+# COMMAND ----------
+# Celda 9: Ver alertas
+
+def query_alerts(limit=30):
+    _, alt_path = get_paths()
+    if USE_UNITY_CATALOG:
+        df = spark.table(UC_TABLE_ALERTS)
+    else:
+        df = spark.read.format("delta").load(alt_path)
+    print(f"Total alertas: {df.count()}")
+    df.orderBy(col("alerted_at").desc()).show(limit, truncate=80)
+
+query_alerts()
+
+# =============================================================================
+# COMMAND ----------
+# Celda 10: Stats por cadena
+
+def stats_by_chain():
+    tok_path, _ = get_paths()
+    if USE_UNITY_CATALOG:
+        df = spark.table(UC_TABLE_TOKENS)
+    else:
+        df = spark.read.format("delta").load(tok_path)
+    df.groupBy("chain_id").count().orderBy(col("count").desc()).show()
+
+stats_by_chain()
+
+# =============================================================================
+# COMMAND ----------
+# Celda 11: Exportar a Pandas
+
+def to_pandas():
+    tok_path, _ = get_paths()
+    if USE_UNITY_CATALOG:
+        df = spark.table(UC_TABLE_TOKENS)
+    else:
+        df = spark.read.format("delta").load(tok_path)
+    pdf = df.toPandas()
+    pdf["links"]       = pdf["links_json"].apply(lambda x: json.loads(x) if x else [])
+    pdf["link_count"]  = pdf["links"].apply(len)
+    pdf["has_twitter"] = pdf["links"].apply(lambda ls: any(l.get("type")=="twitter" for l in ls))
+    pdf["has_website"] = pdf["links"].apply(lambda ls: any(l.get("label")=="Website" for l in ls))
+    pdf["has_desc"]    = pdf["description"].str.strip().astype(bool)
+    print(pdf[["chain_id","token_address","has_twitter","has_website","has_desc","fetched_at"]].head(20))
+    return pdf
+
+pdf = to_pandas()
