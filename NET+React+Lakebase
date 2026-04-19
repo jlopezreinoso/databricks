@@ -1,0 +1,1434 @@
+"""
+==============================================================================
+MÓDULO: ctrl_procesos_estructuras_regulatorias
+TABLA : ctlmaestros.schgold.ctrl_procesos_estructuras_regulatorias
+VERSIÓN: 1.4.0
+DESCRIPCIÓN:
+    Registra y controla la ejecución de procesos sobre estructuras
+    regulatorias en Databricks. Gestiona versionamiento automático por
+    periodo, captura trazabilidad completa y cumple estándares de auditoría.
+
+    CAMBIOS v1.4.0:
+    - Separación en 2 tablas:
+        · gd_dim_estructuras_regulatorias  → catálogo maestro de estructuras
+        · ctrl_procesos_estructuras_regulatorias → auditoría de ejecuciones
+    - Nuevo parámetro obligatorio `codigo_estructura` (FK al catálogo).
+    - Los parámetros `titulo_estructura` y `descripcion_estructura` pasan a
+      ser OPCIONALES: si se omiten, el módulo los resuelve automáticamente
+      desde el catálogo via `codigo_estructura`.
+    - Nuevo método `resolver_estructura()` para consultar el catálogo.
+    - Nuevo método `migrar_schema_v140()` para tablas existentes ≤1.3.0.
+    - Retrocompatibilidad total: los invocadores anteriores que pasaban
+      `titulo_estructura` siguen funcionando sin ningún cambio.
+
+    CAMBIOS v1.3.0:
+    - Nuevo método validar_tabla_fuente() con soporte para múltiples
+      formatos de campo de corte (yyyyMM, DATE, YYYY-MM, etc.)
+    - Comportamiento ante datos ausentes configurable por proceso:
+        "error"       → lanza SinDatosFuenteError y aborta
+        "advertencia" → registra warning en observaciones y continúa
+        "ignorar"     → continúa silenciosamente
+    - Nuevos campos: tabla_fuente, campo_corte_fuente, formato_corte_fuente,
+      valor_corte_fuente, registros_fuente, fuente_validada
+    - Helper _derivar_valor_corte() centraliza la conversión de
+      fecha_corte al formato requerido por cada tabla fuente
+
+    CAMBIOS v1.2.0:
+    - Todos los VARCHAR(N) reemplazados por STRING (compatibilidad Delta)
+    - Columna periodo_clave declarada como STRING en el DDL
+    - Eliminados DEFAULT y CONSTRAINT CHECK (no soportados en Delta Lake)
+    - UPDATEs migrados a DeltaTable.update() para evitar SQL injection
+
+    PATRÓN RECOMENDADO EN EL NOTEBOOK (v1.4.0):
+    ─────────────────────────────────────────────────────────────────────────
+    dbutils.widgets.text("fechaCorte", "2025-03-31", "Fecha de Corte")
+    fecha_corte = dbutils.widgets.get("fechaCorte")
+
+    from ctrl_procesos_estructuras_regulatorias import RegistroEstructuraRegulatoria
+
+    registro = RegistroEstructuraRegulatoria(spark)
+
+    with registro.contexto(
+        nombre               = "SBS_DET_S01",
+        fecha_corte          = fecha_corte,
+        codigo_estructura    = "S01",          # ← FK al catálogo
+        periodicidad         = "MENSUAL",
+        tabla_fuente         = "ctlcobranzas.schgold.gd_det_s01",
+        campo_corte_fuente   = "id_corte",
+        formato_corte_fuente = "yyyyMM",
+        sin_datos_fuente     = "error",
+    ) as reg:
+        df = reg.df_fuente
+        reg.registrar_progreso(registros_procesados=df.count())
+        df.write.mode("overwrite").saveAsTable("schgold.det_s01_procesado")
+    ─────────────────────────────────────────────────────────────────────────
+==============================================================================
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import traceback
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Dict, Generator, Optional
+
+from pyspark.sql.types import (
+    StructType, StructField,
+    StringType, IntegerType, LongType, BooleanType,
+    TimestampType, DateType, DecimalType,
+)
+
+# ---------------------------------------------------------------------------
+# Constantes y enumeraciones
+# ---------------------------------------------------------------------------
+
+TABLA_DESTINO  = "ctlmaestros.schgold.ctrl_procesos_estructuras_regulatorias"
+TABLA_CATALOGO = "ctlmaestros.schgold.gd_dim_estructuras_regulatorias"
+
+PERIODICIDADES_VALIDAS   = {"MENSUAL", "TRIMESTRAL", "SEMESTRAL", "ANUAL", "DIARIO", "SEMANAL"}
+AMBIENTES_VALIDOS        = {"DEV", "QA", "UAT", "PROD"}
+COMPORTAMIENTOS_SIN_DATOS = {"error", "advertencia", "ignorar"}
+
+# Formatos de corte soportados en tablas fuente.
+#
+#  formato_corte_fuente  |  Ejemplo entrada   |  Valor generado en WHERE
+#  ──────────────────────┼────────────────────┼──────────────────────────
+#  "yyyyMM"  / "yyyymm"  |  "2025-03-31"      |  id_corte = '202503'
+#  "yyyy-MM" / "yyyy-mm" |  "2025-03-31"      |  periodo  = '2025-03'
+#  "yyyy-MM-dd"          |  "2025-03-31"      |  fecha    = '2025-03-31'
+#  "DATE"                |  "2025-03-31"      |  fecha    = '2025-03-31'
+#  "yyyy"    / "YYYY"    |  "2025-03-31"      |  anio     = '2025'
+#  "yyyyMMdd"            |  "2025-03-31"      |  id       = '20250331'
+#  "MM/yyyy"             |  "2025-03-31"      |  periodo  = '03/2025'
+#  "INT_yyyyMM"          |  "2025-03-31"      |  id       =  202503 (entero)
+FORMATOS_CORTE = {
+    "yyyyMM":     lambda dt: dt.strftime("%Y%m"),
+    "yyyymm":     lambda dt: dt.strftime("%Y%m"),
+    "yyyy-MM":    lambda dt: dt.strftime("%Y-%m"),
+    "yyyy-mm":    lambda dt: dt.strftime("%Y-%m"),
+    "YYYY-MM":    lambda dt: dt.strftime("%Y-%m"),
+    "yyyy-MM-dd": lambda dt: dt.strftime("%Y-%m-%d"),
+    "yyyy-mm-dd": lambda dt: dt.strftime("%Y-%m-%d"),
+    "YYYY-MM-DD": lambda dt: dt.strftime("%Y-%m-%d"),
+    "DATE":       lambda dt: dt.strftime("%Y-%m-%d"),
+    "yyyy":       lambda dt: dt.strftime("%Y"),
+    "YYYY":       lambda dt: dt.strftime("%Y"),
+    "yyyyMMdd":   lambda dt: dt.strftime("%Y%m%d"),
+    "MM/yyyy":    lambda dt: dt.strftime("%m/%Y"),
+    "MM/YYYY":    lambda dt: dt.strftime("%m/%Y"),
+    "INT_yyyyMM": lambda dt: int(dt.strftime("%Y%m")),
+}
+
+
+class EstadoProceso(str, Enum):
+    INICIADO   = "INICIADO"
+    COMPLETADO = "COMPLETADO"
+    ERROR      = "ERROR"
+    CANCELADO  = "CANCELADO"
+
+
+# ---------------------------------------------------------------------------
+# DDL tabla de auditoría (v1.4.0 — incluye codigo_estructura)
+# ---------------------------------------------------------------------------
+
+DDL_TABLA = f"""
+CREATE TABLE IF NOT EXISTS {TABLA_DESTINO} (
+
+    id_proceso                   BIGINT        GENERATED ALWAYS AS IDENTITY
+                                 COMMENT 'PK autoincremental del proceso',
+    nombre                       STRING        NOT NULL
+                                 COMMENT 'Identificador único del proceso o notebook',
+    descripcion                  STRING
+                                 COMMENT 'Descripción detallada del proceso regulatorio',
+
+    -- REFERENCIA AL CATÁLOGO
+    codigo_estructura            STRING        NOT NULL
+                                 COMMENT 'FK: ctlmaestros.schgold.gd_dim_estructuras_regulatorias.codigo_estructura',
+
+    -- TABLA FUENTE Y VALIDACIÓN DE CORTE
+    tabla_fuente                 STRING
+                                 COMMENT 'Nombre completo de la tabla fuente (catalog.schema.tabla)',
+    campo_corte_fuente           STRING
+                                 COMMENT 'Campo de corte en la tabla fuente',
+    formato_corte_fuente         STRING
+                                 COMMENT 'Formato del campo de corte: yyyyMM, DATE, yyyy-MM, etc.',
+    valor_corte_fuente           STRING
+                                 COMMENT 'Valor derivado de fecha_corte en el formato de la tabla fuente',
+    registros_fuente             BIGINT
+                                 COMMENT 'Registros encontrados en la tabla fuente para el corte',
+    fuente_validada              BOOLEAN
+                                 COMMENT 'TRUE si se ejecutó validación de la tabla fuente',
+
+    -- PERIODO Y VERSIONAMIENTO
+    periodicidad                 STRING        NOT NULL
+                                 COMMENT 'Frecuencia: DIARIO, SEMANAL, MENSUAL, TRIMESTRAL, SEMESTRAL, ANUAL',
+    fecha_corte                  DATE          NOT NULL
+                                 COMMENT 'Fecha de corte recibida desde el widget fechaCorte (YYYY-MM-DD)',
+    fecha_estructura_regulatoria DATE          NOT NULL
+                                 COMMENT 'Fecha oficial de la estructura (igual a fecha_corte salvo ajuste explícito)',
+    anio_periodo                 INT           NOT NULL
+                                 COMMENT 'Año del periodo, derivado automáticamente de fecha_corte',
+    mes_periodo                  INT           NOT NULL
+                                 COMMENT 'Mes del periodo (1-12), derivado de fecha_corte',
+    periodo_clave                STRING        GENERATED ALWAYS AS (
+                                     LPAD(CAST(anio_periodo AS STRING), 4, '0') || '-' ||
+                                     LPAD(CAST(mes_periodo  AS STRING), 2, '0')
+                                 )
+                                 COMMENT 'Clave calculada YYYY-MM para filtros y particionamiento',
+    version                      INT           NOT NULL
+                                 COMMENT 'Versión del procesamiento para el mismo periodo',
+    es_reproceso                 BOOLEAN       NOT NULL
+                                 COMMENT 'TRUE si version > 1 (re-ejecución del mismo periodo)',
+
+    -- ESTADO Y MÉTRICAS
+    estado_proceso               STRING        NOT NULL
+                                 COMMENT 'Estado: INICIADO | COMPLETADO | ERROR | CANCELADO',
+    fecha_inicio_ejecucion       TIMESTAMP     NOT NULL
+                                 COMMENT 'Timestamp UTC de inicio',
+    fecha_fin_ejecucion          TIMESTAMP
+                                 COMMENT 'Timestamp UTC de finalización (NULL mientras INICIADO)',
+    duracion_segundos            DECIMAL(10,3)
+                                 COMMENT 'Duración total en segundos con milisegundos',
+    registros_procesados         BIGINT
+                                 COMMENT 'Registros afectados o procesados',
+    registros_con_error          BIGINT
+                                 COMMENT 'Registros que fallaron validación o procesamiento',
+    mensaje_error                STRING
+                                 COMMENT 'Stacktrace o descripción del error si estado = ERROR',
+    codigo_error                 STRING
+                                 COMMENT 'Código corto del error para clasificación en dashboards',
+
+    -- AUDITORÍA ESTÁNDAR
+    fecha_creacion               TIMESTAMP     NOT NULL
+                                 COMMENT 'Timestamp UTC de inserción',
+    fecha_actualizacion          TIMESTAMP     NOT NULL
+                                 COMMENT 'Timestamp UTC de última actualización',
+    usuario_creacion             STRING        NOT NULL
+                                 COMMENT 'Cuenta que insertó el registro',
+    usuario_ejecucion            STRING        NOT NULL
+                                 COMMENT 'Cuenta que disparó la ejecución',
+    usuario_actualizacion        STRING
+                                 COMMENT 'Cuenta de la última modificación',
+
+    -- CONTEXTO TÉCNICO DATABRICKS
+    notebook_path                STRING
+                                 COMMENT 'Ruta absoluta del notebook',
+    cluster_id                   STRING
+                                 COMMENT 'ID del cluster Databricks',
+    job_id                       STRING
+                                 COMMENT 'ID del Databricks Job',
+    job_run_id                   STRING
+                                 COMMENT 'ID del run del Job',
+    task_key                     STRING
+                                 COMMENT 'Clave de la tarea dentro del Workflow',
+    ambiente                     STRING        NOT NULL
+                                 COMMENT 'Ambiente: DEV | QA | UAT | PROD',
+    spark_version                STRING
+                                 COMMENT 'Versión de Spark / Databricks Runtime',
+
+    -- TRAZABILIDAD AVANZADA
+    ip_origen                    STRING
+                                 COMMENT 'IP del driver que disparó la ejecución',
+    parametros_ejecucion         STRING
+                                 COMMENT 'JSON con todos los parámetros/widgets',
+    hash_parametros              STRING
+                                 COMMENT 'SHA-256 de parametros_ejecucion',
+    id_proceso_padre             BIGINT
+                                 COMMENT 'FK al proceso padre en orquestaciones multi-notebook',
+    tags                         STRING
+                                 COMMENT 'Etiquetas libres en formato JSON',
+    observaciones                STRING
+                                 COMMENT 'Comentarios manuales o automáticos'
+)
+USING DELTA
+COMMENT 'Auditoría de procesos regulatorios. FK codigo_estructura → gd_dim_estructuras_regulatorias.'
+PARTITIONED BY (anio_periodo, mes_periodo)
+TBLPROPERTIES (
+    'delta.enableChangeDataFeed'       = 'true',
+    'delta.autoOptimize.optimizeWrite' = 'true',
+    'delta.autoOptimize.autoCompact'   = 'true'
+);
+"""
+
+# DDL tabla catálogo (solo para auto-creación desde el módulo si se desea)
+DDL_CATALOGO = f"""
+CREATE TABLE IF NOT EXISTS {TABLA_CATALOGO} (
+    id_estructura               BIGINT        GENERATED ALWAYS AS IDENTITY
+                                COMMENT 'PK autoincremental',
+    codigo_estructura           STRING        NOT NULL
+                                COMMENT 'Código único del formulario: S01, S05, S07, F6, etc.',
+    titulo_estructura           STRING        NOT NULL
+                                COMMENT 'Nombre oficial de la estructura',
+    descripcion_estructura      STRING
+                                COMMENT 'Descripción completa de la estructura',
+    entidad_reguladora          STRING
+                                COMMENT 'SBS, BCE, SEPS, SMV, SFC, etc.',
+    normativa_aplicable         STRING
+                                COMMENT 'Resolución o circular de referencia',
+    tipo_estructura             STRING
+                                COMMENT 'Categoría: BALANCE, CARTERA, COBRANZA, PROVISION, etc.',
+    periodicidad_default        STRING        NOT NULL
+                                COMMENT 'Periodicidad por defecto de la estructura',
+    tabla_fuente_default        STRING
+                                COMMENT 'Tabla fuente principal (catalog.schema.tabla)',
+    campo_corte_default         STRING
+                                COMMENT 'Campo de corte por defecto',
+    formato_corte_default       STRING
+                                COMMENT 'Formato del campo de corte por defecto',
+    fecha_vigencia_desde        DATE          NOT NULL
+                                COMMENT 'Fecha desde la que está vigente (inclusive)',
+    fecha_vigencia_hasta        DATE
+                                COMMENT 'Fecha de fin de vigencia (NULL = vigente)',
+    activo                      BOOLEAN       NOT NULL
+                                COMMENT 'TRUE si la estructura está activa',
+    url_documentacion           STRING
+                                COMMENT 'Enlace a documentación oficial',
+    responsable_negocio         STRING
+                                COMMENT 'Área responsable',
+    tags                        STRING
+                                COMMENT 'Etiquetas libres JSON',
+    observaciones               STRING
+                                COMMENT 'Notas adicionales',
+    fecha_creacion              TIMESTAMP     NOT NULL
+                                COMMENT 'Timestamp UTC de inserción',
+    fecha_actualizacion         TIMESTAMP     NOT NULL
+                                COMMENT 'Timestamp UTC de última modificación',
+    usuario_creacion            STRING        NOT NULL
+                                COMMENT 'Cuenta que insertó el registro',
+    usuario_actualizacion       STRING
+                                COMMENT 'Cuenta de la última modificación'
+)
+USING DELTA
+COMMENT 'Catálogo maestro de estructuras y formularios regulatorios.'
+PARTITIONED BY (entidad_reguladora)
+TBLPROPERTIES (
+    'delta.enableChangeDataFeed'       = 'true',
+    'delta.autoOptimize.optimizeWrite' = 'true',
+    'delta.autoOptimize.autoCompact'   = 'true'
+);
+"""
+
+
+# ---------------------------------------------------------------------------
+# Excepción personalizada
+# ---------------------------------------------------------------------------
+
+class SinDatosFuenteError(Exception):
+    """
+    Se lanza cuando sin_datos_fuente='error' y la tabla fuente no tiene
+    registros para el corte indicado.
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parsear_fecha_corte(fecha_corte: str) -> datetime:
+    """
+    Parsea la fecha_corte recibida desde el widget de Databricks.
+    Acepta: 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD-MM-YYYY', 'DD/MM/YYYY'.
+    """
+    fecha_corte = (fecha_corte or "").strip()
+    if not fecha_corte:
+        raise ValueError(
+            "El parámetro 'fecha_corte' está vacío. "
+            "Verifica que el widget 'fechaCorte' tenga un valor antes de ejecutar."
+        )
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(fecha_corte, fmt)
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Formato de fecha_corte no reconocido: '{fecha_corte}'. "
+        "Formatos válidos: YYYY-MM-DD, YYYY/MM/DD, DD-MM-YYYY, DD/MM/YYYY."
+    )
+
+
+def _derivar_valor_corte(dt: datetime, formato: str) -> Any:
+    """
+    Convierte un datetime al valor de corte requerido por la tabla fuente
+    según el formato declarado.
+    """
+    if formato in FORMATOS_CORTE:
+        return FORMATOS_CORTE[formato](dt)
+    formato_lower = formato.lower()
+    for clave, fn in FORMATOS_CORTE.items():
+        if clave.lower() == formato_lower:
+            return fn(dt)
+    try:
+        return dt.strftime(formato)
+    except Exception:
+        raise ValueError(
+            f"formato_corte_fuente '{formato}' no reconocido. "
+            f"Formatos disponibles: {list(FORMATOS_CORTE.keys())} "
+            "o cualquier patrón strftime válido (ej: '%Y%m')."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Clase principal
+# ---------------------------------------------------------------------------
+
+class RegistroEstructuraRegulatoria:
+    """
+    Gestiona el ciclo de vida del registro de auditoría para estructuras
+    regulatorias en Databricks.
+
+    Parámetros
+    ----------
+    spark       : SparkSession activa.
+    ambiente    : 'DEV' | 'QA' | 'UAT' | 'PROD'. Por defecto 'PROD'.
+    auto_crear  : Si True, ejecuta el DDL si las tablas no existen.
+    id_padre    : id_proceso del notebook padre en orquestaciones multi-notebook.
+    """
+
+    def __init__(
+        self,
+        spark,
+        ambiente:   str  = "PROD",
+        auto_crear: bool = True,
+        id_padre:   Optional[int] = None,
+    ):
+        self.spark      = spark
+        self.ambiente   = ambiente.upper()
+        self.id_padre   = id_padre
+        self._id_actual: Optional[int] = None
+        self.df_fuente  = None
+
+        if self.ambiente not in AMBIENTES_VALIDOS:
+            raise ValueError(f"ambiente debe ser uno de {AMBIENTES_VALIDOS}")
+
+        if auto_crear:
+            self._crear_tablas_si_no_existen()
+
+    # ── Creación de tablas ────────────────────────────────────────────────────
+
+    def _crear_tablas_si_no_existen(self) -> None:
+        """Crea el catálogo y la tabla de auditoría si no existen."""
+        for ddl, nombre in [(DDL_CATALOGO, TABLA_CATALOGO), (DDL_TABLA, TABLA_DESTINO)]:
+            try:
+                self.spark.sql(ddl)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"No se pudo crear/verificar la tabla {nombre}: {exc}"
+                ) from exc
+
+    # ── Resolución de estructura desde catálogo ──────────────────────────────
+
+    def resolver_estructura(self, codigo_estructura: str) -> Optional[Dict[str, Any]]:
+        """
+        Consulta el catálogo y retorna un dict con los campos de la estructura,
+        o None si no existe el código.
+
+        Útil para pre-completar título, periodicidad, tabla fuente, etc.
+        """
+        try:
+            rows = self.spark.sql(f"""
+                SELECT titulo_estructura,
+                       descripcion_estructura,
+                       periodicidad_default,
+                       tabla_fuente_default,
+                       campo_corte_default,
+                       formato_corte_default,
+                       entidad_reguladora,
+                       tipo_estructura,
+                       activo
+                FROM   {TABLA_CATALOGO}
+                WHERE  codigo_estructura = '{self._escapar(codigo_estructura)}'
+                AND    activo            = TRUE
+                LIMIT 1
+            """).collect()
+            if rows:
+                return rows[0].asDict()
+        except Exception:
+            pass
+        return None
+
+    # ── Migración de schema v1.3.0 → v1.4.0 ─────────────────────────────────
+
+    def migrar_schema_v140(self) -> None:
+        """
+        Agrega la columna codigo_estructura a una tabla de auditoría existente
+        creada con versión ≤1.3.0.
+
+        Ejecutar UNA SOLA VEZ antes de usar este módulo actualizado:
+
+            registro = RegistroEstructuraRegulatoria(spark)
+            registro.migrar_schema_v140()
+
+        Es idempotente gracias a IF NOT EXISTS.
+        """
+        print("=== Migración de schema v1.3.0 → v1.4.0 ===")
+
+        # 1. Columna nueva en tabla de auditoría
+        try:
+            self.spark.sql(f"""
+                ALTER TABLE {TABLA_DESTINO}
+                ADD COLUMN IF NOT EXISTS codigo_estructura STRING
+                COMMENT 'FK: {TABLA_CATALOGO}.codigo_estructura'
+            """)
+            print(f"  ✓ Columna 'codigo_estructura' verificada/agregada en {TABLA_DESTINO}.")
+        except Exception as exc:
+            print(f"  ✗ Error en 'codigo_estructura': {exc}")
+
+        # 2. Poblar retroactivamente desde titulo_estructura (lógica aproximada)
+        print("  ℹ  Poblando 'codigo_estructura' desde 'titulo_estructura' donde sea NULL...")
+        print("     Revisa y ajusta el CASE según tus datos reales.")
+        try:
+            self.spark.sql(f"""
+                UPDATE {TABLA_DESTINO}
+                SET    codigo_estructura = CASE
+                           WHEN titulo_estructura LIKE '%S01%'       THEN 'S01'
+                           WHEN titulo_estructura LIKE '%S05%'       THEN 'S05'
+                           WHEN titulo_estructura LIKE '%S07%'       THEN 'S07'
+                           WHEN titulo_estructura LIKE '%Balance%4%' THEN 'BALANCE_4A'
+                           WHEN titulo_estructura LIKE '%F6%'        THEN 'F6'
+                           ELSE UPPER(REGEXP_REPLACE(titulo_estructura, '[^A-Za-z0-9]', '_'))
+                       END
+                WHERE  codigo_estructura IS NULL
+            """)
+            print("  ✓ Migración de datos completada.")
+        except Exception as exc:
+            print(f"  ✗ Error al poblar datos: {exc}. Poblar manualmente si es necesario.")
+
+        print("Migración de schema v1.4.0 completada.")
+
+    # ── Migración de schema v1.2.0 → v1.3.0 (heredado) ─────────────────────
+
+    def migrar_schema(self) -> None:
+        """
+        Agrega las columnas de v1.3.0 a tablas existentes creadas con ≤v1.2.0.
+        Para migrar de v1.3.0 a v1.4.0 usa migrar_schema_v140().
+        """
+        columnas_nuevas = [
+            ("tabla_fuente",         "STRING",  "Nombre completo de la tabla fuente analizada"),
+            ("campo_corte_fuente",   "STRING",  "Campo de corte en la tabla fuente"),
+            ("formato_corte_fuente", "STRING",  "Formato del campo de corte"),
+            ("valor_corte_fuente",   "STRING",  "Valor derivado de fecha_corte"),
+            ("registros_fuente",     "BIGINT",  "Registros en la tabla fuente para el corte"),
+            ("fuente_validada",      "BOOLEAN", "TRUE si se ejecutó validación de la tabla fuente"),
+        ]
+        for col_nombre, col_tipo, col_comentario in columnas_nuevas:
+            try:
+                self.spark.sql(f"""
+                    ALTER TABLE {TABLA_DESTINO}
+                    ADD COLUMN IF NOT EXISTS {col_nombre} {col_tipo}
+                    COMMENT '{col_comentario}'
+                """)
+                print(f"  ✓ Columna '{col_nombre}' verificada/agregada.")
+            except Exception as exc:
+                print(f"  ✗ Error en '{col_nombre}': {exc}")
+        print("Migración de schema v1.3.0 completada.")
+
+    # ── Contexto Databricks ──────────────────────────────────────────────────
+
+    def _obtener_contexto_databricks(self) -> Dict[str, Optional[str]]:
+        ctx: Dict[str, Optional[str]] = {
+            "notebook_path": None,
+            "cluster_id":    None,
+            "job_id":        None,
+            "job_run_id":    None,
+            "task_key":      None,
+            "spark_version": None,
+            "usuario":       None,
+            "ip_origen":     None,
+        }
+
+        nb_ctx = None
+        try:
+            from pyspark.dbutils import DBUtils  # type: ignore
+            dbutils = DBUtils(self.spark)
+            nb_ctx  = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+            ctx["notebook_path"] = nb_ctx.notebookPath().getOrElse(None)
+            ctx["cluster_id"]    = nb_ctx.clusterId().getOrElse(None)
+            ctx["job_id"]        = str(nb_ctx.jobId().getOrElse(None))
+            ctx["job_run_id"]    = str(nb_ctx.jobRunId().getOrElse(None))
+            ctx["task_key"]      = nb_ctx.currentRunId().getOrElse(None)
+            _usuario             = nb_ctx.userName().getOrElse(None)
+            if _usuario and _usuario.strip():
+                ctx["usuario"]   = _usuario.strip()
+        except Exception:
+            pass
+
+        if not ctx["usuario"]:
+            try:
+                _usuario = self.spark.conf.get(
+                    "spark.databricks.clusterUsageTags.clusterCreatorUserName", None
+                )
+                if _usuario and _usuario.strip():
+                    ctx["usuario"] = _usuario.strip()
+            except Exception:
+                pass
+
+        if not ctx["usuario"]:
+            try:
+                import os
+                _usuario = os.environ.get("DATABRICKS_RUNTIME_USER", "").strip()
+                if _usuario:
+                    ctx["usuario"] = _usuario
+            except Exception:
+                pass
+
+        if not ctx["usuario"]:
+            try:
+                _usuario = self.spark.sql("SELECT current_user() AS u").collect()[0]["u"]
+                if _usuario and _usuario.strip():
+                    ctx["usuario"] = _usuario.strip()
+            except Exception:
+                pass
+
+        if not ctx["cluster_id"]:
+            try:
+                ctx["cluster_id"] = self.spark.conf.get(
+                    "spark.databricks.clusterUsageTags.clusterId", None
+                )
+            except Exception:
+                pass
+
+        try:
+            _ip = self.spark.conf.get(
+                "spark.databricks.clusterUsageTags.driverIp", None
+            )
+            if _ip and _ip.strip():
+                ctx["ip_origen"] = _ip.strip()
+        except Exception:
+            pass
+
+        if not ctx["ip_origen"]:
+            try:
+                import socket
+                ctx["ip_origen"] = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                pass
+
+        try:
+            ctx["spark_version"] = self.spark.version
+        except Exception:
+            pass
+
+        return ctx
+
+    # ── Validación de tabla fuente ───────────────────────────────────────────
+
+    def validar_tabla_fuente(
+        self,
+        tabla_fuente:         str,
+        campo_corte_fuente:   str,
+        dt_corte:             datetime,
+        formato_corte_fuente: str = "yyyyMM",
+        sin_datos_fuente:     str = "error",
+    ) -> int:
+        """
+        Valida que la tabla fuente tenga datos para el corte indicado y
+        carga el DataFrame filtrado en self.df_fuente.
+        """
+        if sin_datos_fuente not in COMPORTAMIENTOS_SIN_DATOS:
+            raise ValueError(
+                f"sin_datos_fuente debe ser uno de {COMPORTAMIENTOS_SIN_DATOS}."
+            )
+
+        valor_corte = _derivar_valor_corte(dt_corte, formato_corte_fuente)
+
+        filtro_where = (
+            f"{campo_corte_fuente} = {valor_corte}"
+            if isinstance(valor_corte, int)
+            else f"{campo_corte_fuente} = '{valor_corte}'"
+        )
+
+        try:
+            df = self.spark.sql(f"""
+                SELECT *
+                FROM   {tabla_fuente}
+                WHERE  {filtro_where}
+            """)
+            conteo = df.count()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Error al consultar la tabla fuente '{tabla_fuente}' "
+                f"con filtro [{filtro_where}]: {exc}"
+            ) from exc
+
+        self.df_fuente = df
+
+        if self._id_actual:
+            self._actualizar_metadata_fuente(
+                tabla_fuente         = tabla_fuente,
+                campo_corte_fuente   = campo_corte_fuente,
+                formato_corte_fuente = formato_corte_fuente,
+                valor_corte_fuente   = str(valor_corte),
+                registros_fuente     = conteo,
+                fuente_validada      = True,
+            )
+
+        if conteo == 0:
+            mensaje = (
+                f"No se encontraron registros en '{tabla_fuente}' "
+                f"para [{campo_corte_fuente} = '{valor_corte}'] "
+                f"(formato: {formato_corte_fuente})."
+            )
+            if sin_datos_fuente == "error":
+                raise SinDatosFuenteError(mensaje)
+            elif sin_datos_fuente == "advertencia":
+                aviso = f"[ADVERTENCIA] {mensaje} El proceso continuará con 0 registros."
+                print(aviso)
+                if self._id_actual:
+                    self.registrar_progreso(
+                        registros_procesados = 0,
+                        observaciones        = f"ADVERTENCIA: {mensaje}",
+                    )
+
+        return conteo
+
+    def _actualizar_metadata_fuente(
+        self,
+        tabla_fuente:         str,
+        campo_corte_fuente:   str,
+        formato_corte_fuente: str,
+        valor_corte_fuente:   str,
+        registros_fuente:     int,
+        fuente_validada:      bool,
+    ) -> None:
+        from delta.tables import DeltaTable  # type: ignore
+        from pyspark.sql import functions as F
+
+        dbctx   = self._obtener_contexto_databricks()
+        usuario = dbctx["usuario"] or "desconocido"
+        ahora   = datetime.now(timezone.utc)
+
+        dt = DeltaTable.forName(self.spark, TABLA_DESTINO)
+        dt.update(
+            condition = F.col("id_proceso") == self._id_actual,
+            set = {
+                "tabla_fuente":          F.lit(tabla_fuente),
+                "campo_corte_fuente":    F.lit(campo_corte_fuente),
+                "formato_corte_fuente":  F.lit(formato_corte_fuente),
+                "valor_corte_fuente":    F.lit(valor_corte_fuente),
+                "registros_fuente":      F.lit(registros_fuente),
+                "fuente_validada":       F.lit(fuente_validada),
+                "fecha_actualizacion":   F.lit(ahora),
+                "usuario_actualizacion": F.lit(usuario),
+            }
+        )
+
+    # ── Cálculo de versión ───────────────────────────────────────────────────
+
+    def _calcular_version(
+        self, nombre: str, codigo_estructura: str, anio: int, mes: int
+    ) -> int:
+        try:
+            row = self.spark.sql(f"""
+                SELECT COALESCE(MAX(version), 0) + 1 AS prox_version
+                FROM   {TABLA_DESTINO}
+                WHERE  nombre             = '{self._escapar(nombre)}'
+                AND    codigo_estructura  = '{self._escapar(codigo_estructura)}'
+                AND    anio_periodo       = {anio}
+                AND    mes_periodo        = {mes}
+            """).collect()
+            return int(row[0]["prox_version"])
+        except Exception:
+            return 1
+
+    # ── Inserción inicial ────────────────────────────────────────────────────
+
+    def iniciar(
+        self,
+        nombre:               str,
+        fecha_corte:          str,
+        codigo_estructura:    str,
+        periodicidad:         str,
+        descripcion:          str = "",
+        # Los siguientes parámetros son opcionales en v1.4.0:
+        # si se omiten se resuelven desde el catálogo.
+        # Si se proveen, tienen precedencia (retrocompatibilidad).
+        titulo_estructura:      Optional[str] = None,
+        descripcion_estructura: Optional[str] = None,
+        parametros:             Optional[Dict[str, Any]] = None,
+        tags:                   Optional[Dict[str, Any]] = None,
+        observaciones:          str = "",
+        fecha_estructura_regulatoria: Optional[str] = None,
+        tabla_fuente:           Optional[str] = None,
+        campo_corte_fuente:     Optional[str] = None,
+        formato_corte_fuente:   str = "yyyyMM",
+        sin_datos_fuente:       str = "error",
+    ) -> int:
+        """
+        Inserta un registro con estado INICIADO y retorna el id_proceso generado.
+
+        Parámetros clave v1.4.0
+        -----------------------
+        codigo_estructura : Código del catálogo (S01, S05, S07, F6, etc.).
+                            Si titulo_estructura se omite, se resuelve automáticamente.
+
+        Los parámetros titulo_estructura y descripcion_estructura son opcionales:
+        se aceptan por retrocompatibilidad pero ya no se almacenan en la tabla
+        de auditoría (residen en el catálogo).
+        """
+        # ── Validar y parsear fecha ──────────────────────────────────────────
+        dt_corte        = _parsear_fecha_corte(fecha_corte)
+        fecha_corte_iso = dt_corte.strftime("%Y-%m-%d")
+        anio_periodo    = dt_corte.year
+        mes_periodo     = dt_corte.month
+        fecha_est       = fecha_estructura_regulatoria or fecha_corte_iso
+
+        # ── Resolver estructura desde catálogo si faltan datos opcionales ────
+        # (solo para validación interna y enriquecer parametros_ejecucion)
+        catalogo = self.resolver_estructura(codigo_estructura)
+        if catalogo is None:
+            import warnings
+            warnings.warn(
+                f"codigo_estructura '{codigo_estructura}' no se encontró en el catálogo "
+                f"({TABLA_CATALOGO}). El proceso continuará pero se recomienda registrar "
+                "la estructura antes de usarla.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Periodicidad: usa la del catálogo como referencia informativa,
+        # pero el parámetro explícito siempre tiene precedencia.
+        self._validar_campos(
+            nombre, anio_periodo, mes_periodo, codigo_estructura, fecha_est, periodicidad
+        )
+
+        # ── Validación previa de tabla fuente ────────────────────────────────
+        registros_fuente_count = None
+        valor_corte_str        = None
+
+        # Si no se provee tabla_fuente explícita, intentar desde catálogo
+        tabla_fuente_efectiva       = tabla_fuente
+        campo_corte_fuente_efectivo = campo_corte_fuente
+        formato_corte_efectivo      = formato_corte_fuente
+
+        if not tabla_fuente_efectiva and catalogo:
+            tabla_fuente_efectiva       = catalogo.get("tabla_fuente_default")
+            campo_corte_fuente_efectivo = catalogo.get("campo_corte_default")
+            formato_corte_efectivo      = catalogo.get("formato_corte_default") or formato_corte_fuente
+
+        if tabla_fuente_efectiva and campo_corte_fuente_efectivo:
+            if sin_datos_fuente not in COMPORTAMIENTOS_SIN_DATOS:
+                raise ValueError(
+                    f"sin_datos_fuente debe ser uno de {COMPORTAMIENTOS_SIN_DATOS}."
+                )
+
+            valor_corte     = _derivar_valor_corte(dt_corte, formato_corte_efectivo)
+            valor_corte_str = str(valor_corte)
+            filtro_where    = (
+                f"{campo_corte_fuente_efectivo} = {valor_corte}"
+                if isinstance(valor_corte, int)
+                else f"{campo_corte_fuente_efectivo} = '{valor_corte}'"
+            )
+
+            try:
+                df = self.spark.sql(f"""
+                    SELECT *
+                    FROM   {tabla_fuente_efectiva}
+                    WHERE  {filtro_where}
+                """)
+                registros_fuente_count = df.count()
+                self.df_fuente = df
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Error al consultar tabla fuente '{tabla_fuente_efectiva}' "
+                    f"con filtro [{filtro_where}]: {exc}"
+                ) from exc
+
+            if registros_fuente_count == 0:
+                mensaje = (
+                    f"No se encontraron registros en '{tabla_fuente_efectiva}' "
+                    f"para [{campo_corte_fuente_efectivo} = '{valor_corte}'] "
+                    f"(formato: {formato_corte_efectivo})."
+                )
+                if sin_datos_fuente == "error":
+                    raise SinDatosFuenteError(mensaje)
+                elif sin_datos_fuente == "advertencia":
+                    print(f"[ADVERTENCIA] {mensaje} El proceso continuará con 0 registros.")
+                    observaciones = (
+                        f"ADVERTENCIA: {mensaje}"
+                        + (f" | {observaciones}" if observaciones else "")
+                    )
+
+        # ── Contexto y metadata ──────────────────────────────────────────────
+        dbctx   = self._obtener_contexto_databricks()
+        version = self._calcular_version(nombre, codigo_estructura, anio_periodo, mes_periodo)
+        ahora   = datetime.now(timezone.utc)
+        usuario = dbctx["usuario"] or "desconocido"
+
+        params_completos = {"fecha_corte": fecha_corte_iso, "codigo_estructura": codigo_estructura}
+        if tabla_fuente_efectiva:
+            params_completos["tabla_fuente"]         = tabla_fuente_efectiva
+            params_completos["campo_corte_fuente"]   = campo_corte_fuente_efectivo
+            params_completos["formato_corte_fuente"] = formato_corte_efectivo
+            params_completos["valor_corte_fuente"]   = valor_corte_str
+        if parametros:
+            params_completos.update(parametros)
+
+        params_json = json.dumps(params_completos, ensure_ascii=False)
+        hash_params = hashlib.sha256(params_json.encode()).hexdigest()
+        tags_json   = json.dumps(tags, ensure_ascii=False) if tags else None
+
+        fila = {
+            "nombre":                        nombre,
+            "descripcion":                   descripcion or None,
+            "codigo_estructura":             codigo_estructura,
+            "tabla_fuente":                  tabla_fuente_efectiva or None,
+            "campo_corte_fuente":            campo_corte_fuente_efectivo or None,
+            "formato_corte_fuente":          formato_corte_efectivo if tabla_fuente_efectiva else None,
+            "valor_corte_fuente":            valor_corte_str,
+            "registros_fuente":              registros_fuente_count,
+            "fuente_validada":               tabla_fuente_efectiva is not None,
+            "periodicidad":                  periodicidad.upper(),
+            "fecha_corte":                   fecha_corte_iso,
+            "fecha_estructura_regulatoria":  fecha_est,
+            "anio_periodo":                  anio_periodo,
+            "mes_periodo":                   mes_periodo,
+            "version":                       version,
+            "es_reproceso":                  version > 1,
+            "estado_proceso":                EstadoProceso.INICIADO.value,
+            "fecha_inicio_ejecucion":        ahora,
+            "fecha_fin_ejecucion":           None,
+            "duracion_segundos":             None,
+            "registros_procesados":          0,
+            "registros_con_error":           0,
+            "mensaje_error":                 None,
+            "codigo_error":                  None,
+            "fecha_creacion":                ahora,
+            "fecha_actualizacion":           ahora,
+            "usuario_creacion":              usuario,
+            "usuario_ejecucion":             usuario,
+            "usuario_actualizacion":         None,
+            "notebook_path":                 dbctx["notebook_path"],
+            "cluster_id":                    dbctx["cluster_id"],
+            "job_id":                        dbctx["job_id"],
+            "job_run_id":                    dbctx["job_run_id"],
+            "task_key":                      dbctx["task_key"],
+            "ambiente":                      self.ambiente,
+            "spark_version":                 dbctx["spark_version"],
+            "ip_origen":                     dbctx["ip_origen"],
+            "parametros_ejecucion":          params_json,
+            "hash_parametros":               hash_params,
+            "id_proceso_padre":              self.id_padre,
+            "tags":                          tags_json,
+            "observaciones":                 observaciones or None,
+        }
+
+        # Excluir columnas GENERATED ALWAYS AS
+        columnas_generadas = {"id_proceso", "periodo_clave"}
+        fila_sin_generadas = {k: v for k, v in fila.items() if k not in columnas_generadas}
+
+        schema = StructType([
+            StructField("nombre",                        StringType(),       False),
+            StructField("descripcion",                   StringType(),       True),
+            StructField("codigo_estructura",             StringType(),       False),
+            StructField("tabla_fuente",                  StringType(),       True),
+            StructField("campo_corte_fuente",            StringType(),       True),
+            StructField("formato_corte_fuente",          StringType(),       True),
+            StructField("valor_corte_fuente",            StringType(),       True),
+            StructField("registros_fuente",              LongType(),         True),
+            StructField("fuente_validada",               BooleanType(),      True),
+            StructField("periodicidad",                  StringType(),       False),
+            StructField("fecha_corte",                   DateType(),         False),
+            StructField("fecha_estructura_regulatoria",  DateType(),         False),
+            StructField("anio_periodo",                  IntegerType(),      False),
+            StructField("mes_periodo",                   IntegerType(),      False),
+            StructField("version",                       IntegerType(),      False),
+            StructField("es_reproceso",                  BooleanType(),      False),
+            StructField("estado_proceso",                StringType(),       False),
+            StructField("fecha_inicio_ejecucion",        TimestampType(),    False),
+            StructField("fecha_fin_ejecucion",           TimestampType(),    True),
+            StructField("duracion_segundos",             DecimalType(10, 3), True),
+            StructField("registros_procesados",          LongType(),         True),
+            StructField("registros_con_error",           LongType(),         True),
+            StructField("mensaje_error",                 StringType(),       True),
+            StructField("codigo_error",                  StringType(),       True),
+            StructField("fecha_creacion",                TimestampType(),    False),
+            StructField("fecha_actualizacion",           TimestampType(),    False),
+            StructField("usuario_creacion",              StringType(),       False),
+            StructField("usuario_ejecucion",             StringType(),       False),
+            StructField("usuario_actualizacion",         StringType(),       True),
+            StructField("notebook_path",                 StringType(),       True),
+            StructField("cluster_id",                    StringType(),       True),
+            StructField("job_id",                        StringType(),       True),
+            StructField("job_run_id",                    StringType(),       True),
+            StructField("task_key",                      StringType(),       True),
+            StructField("ambiente",                      StringType(),       False),
+            StructField("spark_version",                 StringType(),       True),
+            StructField("ip_origen",                     StringType(),       True),
+            StructField("parametros_ejecucion",          StringType(),       True),
+            StructField("hash_parametros",               StringType(),       True),
+            StructField("id_proceso_padre",              LongType(),         True),
+            StructField("tags",                          StringType(),       True),
+            StructField("observaciones",                 StringType(),       True),
+        ])
+
+        from datetime import date as date_type
+        fila_sin_generadas["fecha_corte"] = (
+            datetime.strptime(fila_sin_generadas["fecha_corte"], "%Y-%m-%d").date()
+            if isinstance(fila_sin_generadas["fecha_corte"], str)
+            else fila_sin_generadas["fecha_corte"]
+        )
+        fila_sin_generadas["fecha_estructura_regulatoria"] = (
+            datetime.strptime(fila_sin_generadas["fecha_estructura_regulatoria"], "%Y-%m-%d").date()
+            if isinstance(fila_sin_generadas["fecha_estructura_regulatoria"], str)
+            else fila_sin_generadas["fecha_estructura_regulatoria"]
+        )
+
+        fila_ordenada = [fila_sin_generadas[f.name] for f in schema]
+
+        df_insert = self.spark.createDataFrame([fila_ordenada], schema=schema)
+        df_insert.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(TABLA_DESTINO)
+
+        id_nuevo = self.spark.sql(f"""
+            SELECT MAX(id_proceso) AS id_proceso
+            FROM   {TABLA_DESTINO}
+            WHERE  nombre            = '{self._escapar(nombre)}'
+            AND    codigo_estructura = '{self._escapar(codigo_estructura)}'
+            AND    anio_periodo      = {anio_periodo}
+            AND    mes_periodo       = {mes_periodo}
+            AND    version           = {version}
+        """).collect()[0]["id_proceso"]
+
+        self._id_actual = int(id_nuevo)
+        return self._id_actual
+
+    # ── Actualización de progreso ────────────────────────────────────────────
+
+    def registrar_progreso(
+        self,
+        registros_procesados: int = 0,
+        registros_con_error:  int = 0,
+        observaciones:        str = "",
+    ) -> None:
+        if not self._id_actual:
+            raise RuntimeError("Debes llamar a iniciar() antes de registrar_progreso().")
+
+        from delta.tables import DeltaTable  # type: ignore
+        from pyspark.sql import functions as F
+
+        dbctx   = self._obtener_contexto_databricks()
+        usuario = dbctx["usuario"] or "desconocido"
+        ahora   = datetime.now(timezone.utc)
+
+        dt = DeltaTable.forName(self.spark, TABLA_DESTINO)
+        dt.update(
+            condition = F.col("id_proceso") == self._id_actual,
+            set = {
+                "registros_procesados":  F.lit(registros_procesados),
+                "registros_con_error":   F.lit(registros_con_error),
+                "fecha_actualizacion":   F.lit(ahora),
+                "usuario_actualizacion": F.lit(usuario),
+                "observaciones":         F.lit(observaciones or None),
+            }
+        )
+
+    # ── Cierre exitoso ───────────────────────────────────────────────────────
+
+    def finalizar(
+        self,
+        registros_procesados: int = 0,
+        registros_con_error:  int = 0,
+        observaciones:        str = "",
+    ) -> None:
+        if not self._id_actual:
+            raise RuntimeError("Debes llamar a iniciar() antes de finalizar().")
+
+        from delta.tables import DeltaTable  # type: ignore
+        from pyspark.sql import functions as F
+
+        dbctx   = self._obtener_contexto_databricks()
+        usuario = dbctx["usuario"] or "desconocido"
+        ahora   = datetime.now(timezone.utc)
+
+        row = self.spark.sql(f"""
+            SELECT fecha_inicio_ejecucion
+            FROM   {TABLA_DESTINO}
+            WHERE  id_proceso = {self._id_actual}
+        """).collect()
+
+        duracion = None
+        if row and row[0]["fecha_inicio_ejecucion"]:
+            inicio = row[0]["fecha_inicio_ejecucion"]
+            if hasattr(inicio, "tzinfo") and inicio.tzinfo is None:
+                inicio = inicio.replace(tzinfo=timezone.utc)
+            duracion = round((ahora - inicio).total_seconds(), 3)
+
+        dt = DeltaTable.forName(self.spark, TABLA_DESTINO)
+        dt.update(
+            condition = F.col("id_proceso") == self._id_actual,
+            set = {
+                "estado_proceso":        F.lit(EstadoProceso.COMPLETADO.value),
+                "fecha_fin_ejecucion":   F.lit(ahora),
+                "duracion_segundos":     F.lit(duracion),
+                "registros_procesados":  F.lit(registros_procesados),
+                "registros_con_error":   F.lit(registros_con_error),
+                "fecha_actualizacion":   F.lit(ahora),
+                "usuario_actualizacion": F.lit(usuario),
+                "observaciones":         F.lit(observaciones or None),
+            }
+        )
+
+    # ── Registro de error ────────────────────────────────────────────────────
+
+    def registrar_error(
+        self,
+        excepcion:            Exception,
+        codigo_error:         str = "ERR_GENERICO",
+        registros_procesados: int = 0,
+        registros_con_error:  int = 0,
+    ) -> None:
+        if not self._id_actual:
+            return
+
+        from delta.tables import DeltaTable  # type: ignore
+        from pyspark.sql import functions as F
+
+        dbctx      = self._obtener_contexto_databricks()
+        usuario    = dbctx["usuario"] or "desconocido"
+        ahora      = datetime.now(timezone.utc)
+        stacktrace = traceback.format_exc()
+        msg_error  = f"{type(excepcion).__name__}: {str(excepcion)}"
+        detalle    = f"{msg_error}\n---\n{stacktrace}"[:4000]
+
+        row = self.spark.sql(f"""
+            SELECT fecha_inicio_ejecucion
+            FROM   {TABLA_DESTINO}
+            WHERE  id_proceso = {self._id_actual}
+        """).collect()
+
+        duracion = None
+        if row and row[0]["fecha_inicio_ejecucion"]:
+            inicio = row[0]["fecha_inicio_ejecucion"]
+            if hasattr(inicio, "tzinfo") and inicio.tzinfo is None:
+                inicio = inicio.replace(tzinfo=timezone.utc)
+            duracion = round((ahora - inicio).total_seconds(), 3)
+
+        dt = DeltaTable.forName(self.spark, TABLA_DESTINO)
+        dt.update(
+            condition = F.col("id_proceso") == self._id_actual,
+            set = {
+                "estado_proceso":        F.lit(EstadoProceso.ERROR.value),
+                "fecha_fin_ejecucion":   F.lit(ahora),
+                "duracion_segundos":     F.lit(duracion),
+                "registros_procesados":  F.lit(registros_procesados),
+                "registros_con_error":   F.lit(registros_con_error),
+                "mensaje_error":         F.lit(detalle),
+                "codigo_error":          F.lit(codigo_error),
+                "fecha_actualizacion":   F.lit(ahora),
+                "usuario_actualizacion": F.lit(usuario),
+            }
+        )
+
+    # ── Context manager ──────────────────────────────────────────────────────
+
+    @contextmanager
+    def contexto(
+        self,
+        nombre:               str,
+        fecha_corte:          str,
+        codigo_estructura:    str,
+        periodicidad:         str,
+        descripcion:          str = "",
+        # Opcionales por retrocompatibilidad (ignorados en v1.4.0, residen en catálogo)
+        titulo_estructura:      Optional[str] = None,
+        descripcion_estructura: Optional[str] = None,
+        parametros:             Optional[Dict[str, Any]] = None,
+        tags:                   Optional[Dict[str, Any]] = None,
+        observaciones_inicio:   str = "",
+        fecha_estructura_regulatoria: Optional[str] = None,
+        tabla_fuente:           Optional[str] = None,
+        campo_corte_fuente:     Optional[str] = None,
+        formato_corte_fuente:   str = "yyyyMM",
+        sin_datos_fuente:       str = "error",
+    ) -> Generator["RegistroEstructuraRegulatoria", None, None]:
+        """
+        Context manager que gestiona el ciclo completo:
+        validar fuente → iniciar → [lógica del notebook] → finalizar | registrar_error.
+
+        El DataFrame filtrado queda en self.df_fuente.
+
+        Ejemplo mínimo v1.4.0:
+            with registro.contexto(
+                nombre             = "SBS_DET_S01",
+                fecha_corte        = fecha_corte,
+                codigo_estructura  = "S01",
+                periodicidad       = "MENSUAL",
+                tabla_fuente       = "ctlcobranzas.schgold.gd_det_s01",
+                campo_corte_fuente = "id_corte",
+            ) as reg:
+                reg.registrar_progreso(registros_procesados=reg.df_fuente.count())
+        """
+        self.iniciar(
+            nombre                       = nombre,
+            fecha_corte                  = fecha_corte,
+            codigo_estructura            = codigo_estructura,
+            periodicidad                 = periodicidad,
+            descripcion                  = descripcion,
+            titulo_estructura            = titulo_estructura,
+            descripcion_estructura       = descripcion_estructura,
+            parametros                   = parametros,
+            tags                         = tags,
+            observaciones                = observaciones_inicio,
+            fecha_estructura_regulatoria = fecha_estructura_regulatoria,
+            tabla_fuente                 = tabla_fuente,
+            campo_corte_fuente           = campo_corte_fuente,
+            formato_corte_fuente         = formato_corte_fuente,
+            sin_datos_fuente             = sin_datos_fuente,
+        )
+        try:
+            yield self
+            self.finalizar()
+        except Exception as exc:
+            self.registrar_error(exc)
+            raise
+
+    # ── Consultas de apoyo ───────────────────────────────────────────────────
+
+    def historial(
+        self,
+        nombre:            Optional[str] = None,
+        codigo_estructura: Optional[str] = None,
+        anio:              Optional[int] = None,
+        mes:               Optional[int] = None,
+        limit:             int = 50,
+    ):
+        """Retorna un DataFrame con el historial enriquecido (JOIN con catálogo)."""
+        where = "WHERE 1=1"
+        if nombre:
+            where += f" AND p.nombre = '{self._escapar(nombre)}'"
+        if codigo_estructura:
+            where += f" AND p.codigo_estructura = '{self._escapar(codigo_estructura)}'"
+        if anio:
+            where += f" AND p.anio_periodo = {anio}"
+        if mes:
+            where += f" AND p.mes_periodo  = {mes}"
+        return self.spark.sql(f"""
+            SELECT
+                p.id_proceso,
+                p.nombre,
+                p.codigo_estructura,
+                d.titulo_estructura,
+                d.entidad_reguladora,
+                p.fecha_corte,
+                p.periodo_clave,
+                p.version,
+                p.estado_proceso,
+                p.duracion_segundos,
+                p.registros_procesados,
+                p.registros_con_error,
+                p.tabla_fuente,
+                p.campo_corte_fuente,
+                p.valor_corte_fuente,
+                p.registros_fuente,
+                p.fuente_validada,
+                p.es_reproceso,
+                p.usuario_ejecucion,
+                p.fecha_inicio_ejecucion,
+                p.ambiente
+            FROM   {TABLA_DESTINO} p
+            LEFT JOIN {TABLA_CATALOGO} d
+                   ON p.codigo_estructura = d.codigo_estructura
+            {where}
+            ORDER BY p.fecha_inicio_ejecucion DESC
+            LIMIT  {limit}
+        """)
+
+    def ultima_version_exitosa(
+        self, nombre: str, anio: int, mes: int,
+        codigo_estructura: Optional[str] = None
+    ):
+        """Retorna el registro de la última ejecución exitosa de un periodo."""
+        filtro_codigo = (
+            f"AND codigo_estructura = '{self._escapar(codigo_estructura)}'"
+            if codigo_estructura else ""
+        )
+        return self.spark.sql(f"""
+            SELECT *
+            FROM   {TABLA_DESTINO}
+            WHERE  nombre         = '{self._escapar(nombre)}'
+            AND    anio_periodo   = {anio}
+            AND    mes_periodo    = {mes}
+            AND    estado_proceso = 'COMPLETADO'
+            {filtro_codigo}
+            ORDER BY version DESC
+            LIMIT 1
+        """)
+
+    def resumen_periodo(self, anio: int, mes: int):
+        """Resumen consolidado con JOIN al catálogo para nombre y entidad."""
+        return self.spark.sql(f"""
+            SELECT
+                p.codigo_estructura,
+                d.titulo_estructura,
+                d.entidad_reguladora,
+                p.tabla_fuente,
+                p.valor_corte_fuente,
+                p.registros_fuente,
+                MAX(p.version)              AS ultima_version,
+                MAX(p.estado_proceso)       AS estado,
+                SUM(p.registros_procesados) AS total_registros,
+                MAX(p.duracion_segundos)    AS duracion_seg,
+                MAX(p.fecha_fin_ejecucion)  AS ultima_ejecucion
+            FROM   {TABLA_DESTINO} p
+            LEFT JOIN {TABLA_CATALOGO} d
+                   ON p.codigo_estructura = d.codigo_estructura
+            WHERE  p.anio_periodo = {anio}
+            AND    p.mes_periodo  = {mes}
+            GROUP BY
+                p.codigo_estructura, d.titulo_estructura,
+                d.entidad_reguladora, p.tabla_fuente,
+                p.valor_corte_fuente, p.registros_fuente
+            ORDER BY p.codigo_estructura
+        """)
+
+    # ── Validaciones internas ────────────────────────────────────────────────
+
+    @staticmethod
+    def _validar_campos(
+        nombre:            str,
+        anio:              int,
+        mes:               int,
+        codigo_estructura: str,
+        fecha:             str,
+        periodicidad:      str,
+    ) -> None:
+        errores = []
+        if not nombre or not nombre.strip():
+            errores.append("'nombre' no puede estar vacío.")
+        if not codigo_estructura or not codigo_estructura.strip():
+            errores.append("'codigo_estructura' no puede estar vacío.")
+        if not (1900 <= anio <= 2100):
+            errores.append(f"'anio_periodo' inválido: {anio}. Rango permitido: 1900-2100.")
+        if not (1 <= mes <= 12):
+            errores.append(f"'mes_periodo' inválido: {mes}. Debe estar entre 1 y 12.")
+        if periodicidad.upper() not in PERIODICIDADES_VALIDAS:
+            errores.append(
+                f"'periodicidad' inválida: '{periodicidad}'. "
+                f"Válidas: {PERIODICIDADES_VALIDAS}."
+            )
+        try:
+            datetime.strptime(fecha, "%Y-%m-%d")
+        except ValueError:
+            errores.append(
+                f"'fecha_estructura_regulatoria' inválida: '{fecha}'. Formato: YYYY-MM-DD."
+            )
+        if errores:
+            raise ValueError("Errores de validación:\n  - " + "\n  - ".join(errores))
+
+    @staticmethod
+    def _escapar(texto: str) -> str:
+        return (texto or "").replace("'", "''")
+
+
+# ---------------------------------------------------------------------------
+# Función de conveniencia
+# ---------------------------------------------------------------------------
+
+def registrar_proceso_regulatorio(
+    spark,
+    nombre:               str,
+    fecha_corte:          str,
+    codigo_estructura:    str,
+    periodicidad:         str,
+    descripcion:          str = "",
+    parametros:           Optional[Dict[str, Any]] = None,
+    tags:                 Optional[Dict[str, Any]] = None,
+    ambiente:             str = "PROD",
+    tabla_fuente:         Optional[str] = None,
+    campo_corte_fuente:   Optional[str] = None,
+    formato_corte_fuente: str = "yyyyMM",
+    sin_datos_fuente:     str = "error",
+) -> "RegistroEstructuraRegulatoria":
+    """
+    Crea e inicia un registro en una sola llamada.
+    Retorna el objeto para llamar .finalizar() o .registrar_error() manualmente.
+    """
+    obj = RegistroEstructuraRegulatoria(spark, ambiente=ambiente)
+    obj.iniciar(
+        nombre               = nombre,
+        fecha_corte          = fecha_corte,
+        codigo_estructura    = codigo_estructura,
+        periodicidad         = periodicidad,
+        descripcion          = descripcion,
+        parametros           = parametros,
+        tags                 = tags,
+        tabla_fuente         = tabla_fuente,
+        campo_corte_fuente   = campo_corte_fuente,
+        formato_corte_fuente = formato_corte_fuente,
+        sin_datos_fuente     = sin_datos_fuente,
+    )
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# EJEMPLOS DE USO v1.4.0
+# ---------------------------------------------------------------------------
+
+EJEMPLOS = """
+# ============================================================================
+# CELDA 1 – Widgets
+# ============================================================================
+dbutils.widgets.text("fechaCorte", "2025-03-31", "Fecha de Corte (YYYY-MM-DD)")
+dbutils.widgets.dropdown("ambiente", "PROD", ["DEV", "QA", "UAT", "PROD"])
+
+fecha_corte = dbutils.widgets.get("fechaCorte")
+ambiente    = dbutils.widgets.get("ambiente")
+
+
+# ============================================================================
+# EJEMPLO 1 – Uso estándar v1.4.0 con codigo_estructura
+# ============================================================================
+from ctrl_procesos_estructuras_regulatorias import RegistroEstructuraRegulatoria
+
+registro = RegistroEstructuraRegulatoria(spark, ambiente=ambiente)
+
+with registro.contexto(
+    nombre               = "SBS_str_s01",
+    descripcion          = "Procesamiento del detalle s01 mensual",
+    fecha_corte          = fecha_corte,
+    codigo_estructura    = "S01",          # ← FK al catálogo
+    periodicidad         = "MENSUAL",
+    tabla_fuente         = "ctlcobranzas.schgold.gd_det_s01",
+    campo_corte_fuente   = "id_corte",
+    formato_corte_fuente = "yyyyMM",
+    sin_datos_fuente     = "error",
+) as reg:
+    df = reg.df_fuente   # ya filtrado: WHERE id_corte = '202503'
+    conteo = df.count()
+    reg.registrar_progreso(registros_procesados=conteo)
+    df.write.mode("overwrite").saveAsTable("schgold.det_s01_procesado")
+
+
+# ============================================================================
+# EJEMPLO 2 – Sin tabla_fuente explícita: el módulo la resuelve desde catálogo
+#             (siempre que gd_dim_estructuras_regulatorias tenga tabla_fuente_default)
+# ============================================================================
+with registro.contexto(
+    nombre            = "SBS_str_s01_auto",
+    fecha_corte       = fecha_corte,
+    codigo_estructura = "S01",
+    periodicidad      = "MENSUAL",
+    sin_datos_fuente  = "error",
+) as reg:
+    df = reg.df_fuente
+    reg.registrar_progreso(registros_procesados=df.count())
+
+
+# ============================================================================
+# EJEMPLO 3 – Monitoreo: historial con título resuelto desde catálogo
+# ============================================================================
+mon = RegistroEstructuraRegulatoria(spark, auto_crear=False)
+
+mon.historial(codigo_estructura="S01", anio=2025).display()
+mon.ultima_version_exitosa("SBS_str_s01", 2025, 3, codigo_estructura="S01").display()
+mon.resumen_periodo(2025, 3).display()
+
+
+# ============================================================================
+# EJEMPLO 4 – Migración desde v1.3.0 (ejecutar UNA SOLA VEZ)
+# ============================================================================
+# registro.migrar_schema_v140()
+"""
